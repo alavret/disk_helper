@@ -1,0 +1,9 @@
+﻿# Эти строки — комментарии, будут пропущены
+#\folder1\file1.txt
+#\folder2\file2.docx
+
+# Реальные пути для обработки (замените эти строки на свои)
+/folder3/folder31/file3.docx
+\folder4\file4.xlsx
+/Folder5/File5.pptx
+/FOLDER6/FILE6.docx
