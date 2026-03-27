@@ -2214,6 +2214,226 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
     print("=" * 80)
 
 
+def get_my_disk_resources_metadata(settings: "SettingParams"):
+    """Получает метаданные ресурсов на личном Диске запустившего скрипт пользователя,
+    используя OAUTH_TOKEN из .env без запроса списка пользователей."""
+    input_file = settings.disk_resource_input_file
+    output_file = settings.resource_output_file
+    token = settings.oauth_token
+
+    if not os.path.exists(input_file):
+        logger.error(f"Входной файл не найден: {input_file}")
+        return
+
+    rows: list[str] = []
+    try:
+        with open(input_file, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                rows.append(line)
+    except Exception as e:
+        logger.error(f"Ошибка чтения файла {input_file}: {e}")
+        return
+
+    if not rows:
+        logger.error(f"Во входном файле {input_file} нет данных для обработки.")
+        return
+
+    logger.info(f"Загружено {len(rows)} ресурсов из {input_file}")
+    logger.info("Поиск ресурсов на личном Диске текущего пользователя (OAUTH_TOKEN)")
+
+    results: dict[int, dict] = {}
+    remaining: set[int] = set(range(len(rows)))
+    count_found = 0
+    count_not_found = 0
+    count_files = 0
+    count_dirs = 0
+    count_errors = 0
+    count_ambiguous = 0
+
+    # ── Фаза 1: прямой поиск по оригинальному пути ──
+    logger.info("=== Фаза 1: поиск по оригинальному пути ===")
+    still_remaining: set[int] = set()
+
+    for idx in sorted(remaining):
+        full_path = rows[idx]
+        components = _parse_path_components(full_path)
+        if not components:
+            still_remaining.add(idx)
+            continue
+        disk_path = "disk:/" + "/".join(components)
+        logger.debug(
+            f"[{idx + 1}/{len(rows)}] [Фаза 1] Запрос: {disk_path}"
+        )
+
+        data, meta_error = get_personal_resource_metadata(token, disk_path)
+        if data:
+            resource_type = data.get("type", "")
+            if resource_type == "file":
+                count_files += 1
+            elif resource_type == "dir":
+                count_dirs += 1
+
+            results[idx] = {
+                "name": data.get("name", ""),
+                "path": data.get("path", ""),
+                "created": data.get("created", ""),
+                "modified": data.get("modified", ""),
+                "md5": data.get("md5", ""),
+                "sha256": data.get("sha256", ""),
+                "type": resource_type,
+                "size": data.get("size", ""),
+                "source": "my_disk",
+                "error": "",
+            }
+            count_found += 1
+        else:
+            if meta_error and "404" not in meta_error:
+                logger.warning(
+                    f"[{idx + 1}/{len(rows)}] [Фаза 1] {meta_error}"
+                )
+            still_remaining.add(idx)
+
+        time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+
+    remaining = still_remaining
+    logger.info(
+        f"[Фаза 1] Найдено {count_found}, "
+        f"осталось ненайденных: {len(remaining)}"
+    )
+
+    if remaining:
+        logger.info(
+            f"После фазы 1 не найдено {len(remaining)} ресурс(ов). "
+            f"Список не найденных путей:"
+        )
+        for idx in sorted(remaining):
+            logger.info(f"  - {rows[idx]}")
+    else:
+        logger.info("После фазы 1 все ресурсы найдены.")
+
+    # ── Фаза 2: case-insensitive поиск для ненайденных ──
+    if remaining:
+        logger.info("=== Фаза 2: поиск с учётом регистра (case-insensitive) ===")
+        dir_cache: dict[str, dict] = {}
+        still_remaining_p2: set[int] = set()
+
+        for idx in sorted(remaining):
+            full_path = rows[idx]
+            logger.debug(
+                f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск: {full_path}"
+            )
+
+            resolved_path, resolve_error = resolve_case_insensitive_path(
+                token, full_path, dir_cache
+            )
+
+            if resolve_error:
+                logger.warning(
+                    f"[{idx + 1}/{len(rows)}] [Фаза 2] {resolve_error}"
+                )
+                cleaned = full_path.replace("\\", "/")
+                if cleaned.lower().startswith("<root>"):
+                    cleaned = cleaned[len("<root>"):]
+                name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+                results[idx] = {
+                    "name": name,
+                    "path": full_path,
+                    "created": "",
+                    "modified": "",
+                    "md5": "",
+                    "sha256": "",
+                    "type": "",
+                    "size": "",
+                    "source": "my_disk",
+                    "error": resolve_error,
+                }
+                count_ambiguous += 1
+                continue
+
+            if resolved_path is None:
+                still_remaining_p2.add(idx)
+                continue
+
+            data, meta_error = get_personal_resource_metadata(token, resolved_path)
+            if data:
+                resource_type = data.get("type", "")
+                if resource_type == "file":
+                    count_files += 1
+                elif resource_type == "dir":
+                    count_dirs += 1
+
+                results[idx] = {
+                    "name": data.get("name", ""),
+                    "path": data.get("path", ""),
+                    "created": data.get("created", ""),
+                    "modified": data.get("modified", ""),
+                    "md5": data.get("md5", ""),
+                    "sha256": data.get("sha256", ""),
+                    "type": resource_type,
+                    "size": data.get("size", ""),
+                    "source": "my_disk",
+                    "error": "",
+                }
+                count_found += 1
+            else:
+                if meta_error and "404" not in meta_error:
+                    logger.warning(
+                        f"[{idx + 1}/{len(rows)}] [Фаза 2] {meta_error}"
+                    )
+                    count_errors += 1
+                still_remaining_p2.add(idx)
+
+            time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+
+        remaining = still_remaining_p2
+        logger.info(
+            f"[Фаза 2] Найдено дополнительно, "
+            f"осталось ненайденных: {len(remaining)}"
+        )
+
+    for idx in sorted(remaining):
+        full_path = rows[idx]
+        count_not_found += 1
+        cleaned = full_path.replace("\\", "/")
+        if cleaned.lower().startswith("<root>"):
+            cleaned = cleaned[len("<root>"):]
+        name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+        results[idx] = {
+            "name": name,
+            "path": full_path,
+            "created": "",
+            "modified": "",
+            "md5": "",
+            "sha256": "",
+            "type": "",
+            "size": "",
+            "source": "",
+            "error": "",
+        }
+
+    ordered_results = [results[i] for i in range(len(rows)) if i in results]
+
+    if not export_resources_to_csv(
+        ordered_results, output_file, RESOURCE_OUTPUT_FIELDNAMES
+    ):
+        return
+
+    print("\n" + "=" * 80)
+    print("Сводная информация:")
+    print(f"  Всего ресурсов во входном файле: {len(rows)}")
+    print(f"  Найдено:                         {count_found}")
+    print(f"    - файлов:                      {count_files}")
+    print(f"    - папок:                        {count_dirs}")
+    print(f"  Не найдено:                      {count_not_found}")
+    print(f"  Ошибки неоднозначности:          {count_ambiguous}")
+    print(f"  Ошибки API:                      {count_errors}")
+    print(f"\nРезультаты записаны в: {output_file}")
+    print("=" * 80)
+
+
 # ─────────────────────── Меню ───────────────────────
 
 
@@ -2252,10 +2472,11 @@ def main_menu(settings: "SettingParams"):
         print("Выберите опцию:")
         print("1. Получить метаданные ресурсов Общего Диска.")
         print("2. Получить метаданные ресурсов из личных Дисков пользователей.")
+        print("3. Получить метаданные ресурсов с моего личного Диска.")
         print("9. Настройка сервисного приложения.")
         print("0. (Ctrl+C) Выход")
         print("\n")
-        choice = input("Введите ваш выбор (0,1,2,9): ")
+        choice = input("Введите ваш выбор (0,1,2,3,9): ")
 
         if choice == "0":
             print("До свидания!")
@@ -2264,6 +2485,8 @@ def main_menu(settings: "SettingParams"):
             get_shared_disk_resources_metadata(settings)
         elif choice == "2":
             get_personal_disk_resources_metadata(settings)
+        elif choice == "3":
+            get_my_disk_resources_metadata(settings)
         elif choice == "9":
             service_application_status_menu(settings)
         else:
