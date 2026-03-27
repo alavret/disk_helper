@@ -38,6 +38,7 @@ SERVICE_APP_PERMISSIONS = [
 ]
 
 EXIT_CODE = 1
+IGNORE_SSL = False
 
 RESOURCE_OUTPUT_FIELDNAMES = [
     "name", "path", "created", "modified", "md5", "sha256", "type", "size", "source", "error",
@@ -169,7 +170,7 @@ def check_token_permissions(
     url = "https://api360.yandex.net/whoami"
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
         if response.status_code != HTTPStatus.OK:
             logger.error(f"Невалидный токен. Статус код: {response.status_code}")
             if response.status_code == 401:
@@ -234,7 +235,7 @@ def check_token_permissions_api(token: str) -> tuple[bool, dict]:
     headers = {"Authorization": f"OAuth {token}"}
     result = None
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
         if response.status_code != HTTPStatus.OK:
             logger.error(f"Невалидный токен. Статус код: {response.status_code}")
             if response.status_code == 401:
@@ -273,7 +274,7 @@ def get_service_app_token(settings: "SettingParams", user_email: str) -> str:
     }
 
     try:
-        response = requests.post(DEFAULT_OAUTH_API_URL, data=data, timeout=30)
+        response = requests.post(DEFAULT_OAUTH_API_URL, data=data, timeout=30, verify=not IGNORE_SSL)
     except requests.RequestException as exc:
         raise TokenError(f"Failed to request token: {exc}") from exc
 
@@ -317,6 +318,7 @@ def get_all_api360_users_from_api(settings: "SettingParams") -> list[dict]:
     last_page = 1
     with requests.Session() as session:
         session.headers.update({"Authorization": f"OAuth {settings.oauth_token}"})
+        session.verify = not IGNORE_SSL
         while current_page <= last_page:
             params = {"page": current_page, "perPage": USERS_PER_PAGE_FROM_API}
             try:
@@ -472,7 +474,7 @@ def activate_service_applications(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers)
+            response = requests.post(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(
@@ -507,7 +509,7 @@ def get_service_applications(settings: "SettingParams") -> tuple:
     try:
         while True:
             logger.debug(f"GET URL - {url}")
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
                 if response.json()["message"] == "feature is not active":
@@ -705,7 +707,7 @@ def setup_service_application(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -758,7 +760,7 @@ def delete_service_applications_list(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"DELETE URL - {url}")
-            response = requests.delete(url, headers=headers)
+            response = requests.delete(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -798,7 +800,7 @@ def deactivate_service_applications(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers)
+            response = requests.post(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -897,7 +899,7 @@ def delete_service_application_from_list(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -993,7 +995,7 @@ def check_service_app_status(
         retries = 1
         while True:
             logger.debug(f"GET URL - {url}")
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id','')}"
             )
@@ -1189,7 +1191,7 @@ def import_service_applications_api_data(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -1292,7 +1294,7 @@ def get_resource_metadata(
     while True:
         try:
             logger.debug(f"GET {url} path={vd_path}")
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1343,7 +1345,7 @@ def get_personal_resource_metadata(
         try:
             logger.debug(f"GET {url} path={disk_path}")
             logger.debug(f"OAuth {token}")
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1393,7 +1395,7 @@ def list_directory_page(
     while True:
         try:
             logger.debug(f"GET {url} path={dir_path} limit={limit} offset={offset}")
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1469,7 +1471,7 @@ def list_vd_directory_page(
             logger.debug(
                 f"GET {url} path={vd_dir_path} limit={limit} offset={offset}"
             )
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -2500,6 +2502,12 @@ if __name__ == "__main__":
     else:
         logger.error("Не найден файл .env. Выход.")
         sys.exit(EXIT_CODE)
+
+    IGNORE_SSL = os.environ.get("IGNORE_SSL", "false").lower() == "true"
+    if IGNORE_SSL:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        logger.warning("Проверка SSL-сертификатов отключена (IGNORE_SSL=true)")
 
     logger.info("\n")
     logger.info("---------------------------------------------------------------------------.")
