@@ -40,8 +40,6 @@ NEEDED_PERMISSIONS = [
 SERVICE_APP_PERMISSIONS = [
     "cloud_api:disk.info",
     "cloud_api:disk.read",
-    "cloud_api:disk.write",
-
 ]
 
 EXIT_CODE = 1
