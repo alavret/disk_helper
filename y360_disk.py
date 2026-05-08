@@ -7,13 +7,17 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from typing import Optional
 from urllib.parse import quote
 
+import threading
+
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 
 DEFAULT_360_API_URL = "https://api360.yandex.net"
@@ -26,6 +30,7 @@ RETRIES_DELAY_SEC = 2
 SLEEP_TIME_BETWEEN_API_CALLS = 0.5
 USERS_PER_PAGE_FROM_API = 1000
 ALL_USERS_REFRESH_IN_MINUTES = 15
+MAX_THREADS = 10
 
 NEEDED_PERMISSIONS = [
     "directory:read_users",
@@ -33,7 +38,9 @@ NEEDED_PERMISSIONS = [
 ]
 
 SERVICE_APP_PERMISSIONS = [
-    "cloud_api:disk.info"
+    "cloud_api:disk.info",
+    "cloud_api:disk.read",
+    "cloud_api:disk.write",
 
 ]
 
@@ -41,7 +48,7 @@ EXIT_CODE = 1
 IGNORE_SSL = False
 
 RESOURCE_OUTPUT_FIELDNAMES = [
-    "name", "path", "created", "modified", "md5", "sha256", "type", "size", "source", "error",
+    "name", "path", "created", "modified", "md5", "sha256", "type", "size", "public_url", "source", "error",
 ]
 
 logger = logging.getLogger(LOG_FILE)
@@ -68,6 +75,84 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 
+# ─────────────────────── Rate Limiter ───────────────────────
+
+
+class RateLimiter:
+    def __init__(self, max_calls_per_second: int = 40):
+        self.max_calls = max_calls_per_second
+        self.period = 1.0
+        self.calls: list[float] = []
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self.lock:
+            now = time.time()
+            self.calls = [t for t in self.calls if now - t < self.period]
+            if len(self.calls) >= self.max_calls:
+                oldest_call = self.calls[0]
+                sleep_time = self.period - (now - oldest_call) + 0.01
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    now = time.time()
+                    self.calls = [t for t in self.calls if now - t < self.period]
+            self.calls.append(now)
+
+    def get_current_rate(self) -> int:
+        with self.lock:
+            now = time.time()
+            self.calls = [t for t in self.calls if now - t < self.period]
+            return len(self.calls)
+
+
+api_rate_limiter = RateLimiter(max_calls_per_second=40)
+
+_shared_session: Optional[requests.Session] = None
+_session_lock = threading.Lock()
+
+
+def get_session() -> requests.Session:
+    """Возвращает единый общий Session, безопасный для использования из нескольких потоков.
+
+    Размер пула соединений согласован с MAX_THREADS: одновременно может выполняться
+    не более MAX_THREADS сетевых запросов, что соответствует размеру ThreadPool-а.
+    """
+    global _shared_session
+    if _shared_session is None:
+        with _session_lock:
+            if _shared_session is None:
+                session = requests.Session()
+                retry = Retry(
+                    total=5,
+                    backoff_factor=1,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    raise_on_status=False,
+                )
+                adapter = HTTPAdapter(
+                    max_retries=retry,
+                    pool_connections=MAX_THREADS,
+                    pool_maxsize=MAX_THREADS,
+                    pool_block=True,
+                )
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+                session.verify = not IGNORE_SSL
+                _shared_session = session
+    return _shared_session
+
+
+def close_session() -> None:
+    global _shared_session
+    if _shared_session is not None:
+        with _session_lock:
+            if _shared_session is not None:
+                try:
+                    _shared_session.close()
+                except Exception:
+                    pass
+                _shared_session = None
+
+
 @dataclass
 class SettingParams:
     oauth_token: str
@@ -81,6 +166,7 @@ class SettingParams:
     resource_output_file: str
     service_app_api_data_file: str
     users_file: str
+    single_report_file: bool
     all_users: list
     all_users_get_timestamp: datetime
 
@@ -115,6 +201,7 @@ def get_settings() -> Optional[SettingParams]:
             "SERVICE_APP_API_DATA_FILE", "service_app_api_data.json"
         ),
         users_file=os.environ.get("USERS_FILE", "users.csv"),
+        single_report_file=os.environ.get("SINGLE_REPORT_FILE", "true").lower() == "true",
         all_users=[],
         all_users_get_timestamp=datetime.now(),
     )
@@ -170,7 +257,8 @@ def check_token_permissions(
     url = "https://api360.yandex.net/whoami"
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
+        api_rate_limiter.acquire()
+        response = get_session().get(url, headers=headers, verify=not IGNORE_SSL)
         if response.status_code != HTTPStatus.OK:
             logger.error(f"Невалидный токен. Статус код: {response.status_code}")
             if response.status_code == 401:
@@ -235,7 +323,8 @@ def check_token_permissions_api(token: str) -> tuple[bool, dict]:
     headers = {"Authorization": f"OAuth {token}"}
     result = None
     try:
-        response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
+        api_rate_limiter.acquire()
+        response = get_session().get(url, headers=headers, verify=not IGNORE_SSL)
         if response.status_code != HTTPStatus.OK:
             logger.error(f"Невалидный токен. Статус код: {response.status_code}")
             if response.status_code == 401:
@@ -274,7 +363,8 @@ def get_service_app_token(settings: "SettingParams", user_email: str) -> str:
     }
 
     try:
-        response = requests.post(DEFAULT_OAUTH_API_URL, data=data, timeout=30, verify=not IGNORE_SSL)
+        api_rate_limiter.acquire()
+        response = get_session().post(DEFAULT_OAUTH_API_URL, data=data, timeout=30, verify=not IGNORE_SSL)
     except requests.RequestException as exc:
         raise TokenError(f"Failed to request token: {exc}") from exc
 
@@ -298,56 +388,57 @@ def read_users_csv(path: str) -> list[str]:
         logger.error(f"Файл пользователей не найден: {path}")
         return []
 
+    data_list: list[str] = []
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-
-    data_list = []
-    for row in rows:
-        email = row.get("Email") or row.get("email") or row.get("EMAIL")
-        if email:
-            data_list.append(email.strip().lower())
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+            value = row[0].strip()
+            if not value:
+                continue
+            data_list.append(value)
     return data_list
 
 
 def get_all_api360_users_from_api(settings: "SettingParams") -> list[dict]:
     logger.info("Получение всех пользователей организации из API...")
     url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/users"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
     users = []
     current_page = 1
     last_page = 1
-    with requests.Session() as session:
-        session.headers.update({"Authorization": f"OAuth {settings.oauth_token}"})
-        session.verify = not IGNORE_SSL
-        while current_page <= last_page:
-            params = {"page": current_page, "perPage": USERS_PER_PAGE_FROM_API}
-            try:
-                retries = 1
-                while True:
-                    response = session.get(url, params=params)
-                    if response.status_code != HTTPStatus.OK.value:
+    session = get_session()
+    while current_page <= last_page:
+        params = {"page": current_page, "perPage": USERS_PER_PAGE_FROM_API}
+        try:
+            retries = 1
+            while True:
+                api_rate_limiter.acquire()
+                response = session.get(url, params=params, headers=headers, verify=not IGNORE_SSL)
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(
+                        f"Ошибка при GET запросе url - {url}: "
+                        f"{response.status_code}. {response.text}"
+                    )
+                    if retries < MAX_RETRIES:
                         logger.error(
-                            f"Ошибка при GET запросе url - {url}: "
-                            f"{response.status_code}. {response.text}"
+                            f"Повторная попытка ({retries + 1}/{MAX_RETRIES})"
                         )
-                        if retries < MAX_RETRIES:
-                            logger.error(
-                                f"Повторная попытка ({retries + 1}/{MAX_RETRIES})"
-                            )
-                            time.sleep(RETRIES_DELAY_SEC * retries)
-                            retries += 1
-                        else:
-                            return []
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
                     else:
-                        for user in response.json().get("users", []):
-                            if not user.get("isRobot"):
-                                users.append(user)
-                        current_page += 1
-                        last_page = response.json().get("pages", current_page)
-                        break
-            except requests.exceptions.RequestException as exc:
-                logger.error(f"RequestException: {exc}")
-                return []
+                        return []
+                else:
+                    for user in response.json().get("users", []):
+                        if not user.get("isRobot"):
+                            users.append(user)
+                    current_page += 1
+                    last_page = response.json().get("pages", current_page)
+                    break
+        except requests.exceptions.RequestException as exc:
+            logger.error(f"RequestException: {exc}")
+            return []
 
     return users
 
@@ -474,7 +565,8 @@ def activate_service_applications(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().post(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(
@@ -509,7 +601,8 @@ def get_service_applications(settings: "SettingParams") -> tuple:
     try:
         while True:
             logger.debug(f"GET URL - {url}")
-            response = requests.get(url, headers=headers, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
                 if response.json()["message"] == "feature is not active":
@@ -707,7 +800,8 @@ def setup_service_application(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -760,7 +854,8 @@ def delete_service_applications_list(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"DELETE URL - {url}")
-            response = requests.delete(url, headers=headers, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().delete(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -800,7 +895,8 @@ def deactivate_service_applications(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().post(url, headers=headers, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -899,7 +995,8 @@ def delete_service_application_from_list(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -995,7 +1092,8 @@ def check_service_app_status(
         retries = 1
         while True:
             logger.debug(f"GET URL - {url}")
-            response = requests.get(url, headers=headers, params=params, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, params=params, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id','')}"
             )
@@ -1191,7 +1289,8 @@ def import_service_applications_api_data(settings: "SettingParams") -> bool:
     try:
         while True:
             logger.debug(f"POST URL - {url}")
-            response = requests.post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().post(url, headers=headers, json=payload, verify=not IGNORE_SSL)
             logger.debug(
                 f'X-Request-Id: {response.headers.get("X-Request-Id","")}'
             )
@@ -1271,6 +1370,29 @@ def build_vd_path(vd_hash: str, full_path: str) -> str:
     return f"vd:{vd_hash}:disk:/{cleaned}"
 
 
+def normalize_vd_path_from_api(api_path: str) -> str:
+    """Преобразует путь общего диска, возвращённый API в поле "path", в формат,
+    ожидаемый API в параметре ?path= при последующих запросах.
+
+    API в ответе отдаёт путь вида ``vd:/HASH/disk/<rest>``, а в запросе ожидает
+    ``vd:HASH:disk:/<rest>``. Если путь не похож на формат VD-диска, возвращается
+    исходное значение без изменений.
+
+    Пример:
+        ``vd:/6DE3vqG1oY9A3w/disk/Тестируем шаринг 01``
+            → ``vd:6DE3vqG1oY9A3w:disk:/Тестируем шаринг 01``
+    """
+    if not api_path or not api_path.startswith("vd:/"):
+        return api_path
+    rest = api_path[len("vd:/"):]
+    parts = rest.split("/", 2)
+    if len(parts) < 2 or parts[1] != "disk":
+        return api_path
+    vd_hash = parts[0]
+    tail = parts[2] if len(parts) > 2 else ""
+    return f"vd:{vd_hash}:disk:/{tail}"
+
+
 def build_personal_disk_path(full_path: str) -> str:
     """Преобразует путь из входного файла (с <Root> и обратными слешами) в формат API личного Диска."""
     cleaned = full_path
@@ -1294,7 +1416,8 @@ def get_resource_metadata(
     while True:
         try:
             logger.debug(f"GET {url} path={vd_path}")
-            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1345,7 +1468,8 @@ def get_personal_resource_metadata(
         try:
             logger.debug(f"GET {url} path={disk_path}")
             logger.debug(f"OAuth {token}")
-            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1395,7 +1519,8 @@ def list_directory_page(
     while True:
         try:
             logger.debug(f"GET {url} path={dir_path} limit={limit} offset={offset}")
-            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1471,7 +1596,8 @@ def list_vd_directory_page(
             logger.debug(
                 f"GET {url} path={vd_dir_path} limit={limit} offset={offset}"
             )
-            response = requests.get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
+            api_rate_limiter.acquire()
+            response = get_session().get(url, headers=headers, params=params, timeout=30, verify=not IGNORE_SSL)
             logger.debug(
                 f"x-request-id: {response.headers.get('x-request-id', '')}"
             )
@@ -1697,6 +1823,150 @@ def export_resources_to_csv(
         return False
 
 
+# ─────────────────────── Вспомогательные функции для листинга ───────────────────────
+
+
+def safe_filename(text: str) -> str:
+    """Заменяет символы, недопустимые в именах файлов, на подчёркивание."""
+    return re.sub(r"[^\w\-]", "_", text)
+
+
+def build_report_filepath(base_file: str, timestamp: str, suffix: str = "") -> str:
+    """Формирует путь к выходному файлу с меткой времени и опциональным суффиксом."""
+    stem, ext = os.path.splitext(base_file)
+    if suffix:
+        return f"{stem}_{suffix}_{timestamp}{ext}"
+    return f"{stem}_{timestamp}{ext}"
+
+
+def write_csv_file(
+    results: list[dict], output_path: str, fieldnames: list[str]
+) -> bool:
+    """Записывает список словарей в CSV-файл по указанному пути."""
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
+            writer.writeheader()
+            writer.writerows(results)
+        logger.info(
+            f"Результаты сохранены в файл: {output_path} ({len(results)} строк)"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка записи в файл {output_path}: {e}")
+        return False
+
+
+def item_to_csv_row(item: dict, source: str) -> dict:
+    """Преобразует элемент ответа API Диска в строку для CSV-отчёта."""
+    return {
+        "name": item.get("name", ""),
+        "path": item.get("path", ""),
+        "created": item.get("created", ""),
+        "modified": item.get("modified", ""),
+        "md5": item.get("md5", ""),
+        "sha256": item.get("sha256", ""),
+        "type": item.get("type", ""),
+        "size": item.get("size", ""),
+        "public_url": item.get("public_url", ""),
+        "source": source,
+        "error": "",
+    }
+
+
+def walk_vd_all_items(token: str, vd_root_path: str) -> list[dict]:
+    """Рекурсивно обходит все ресурсы виртуального диска начиная с указанного пути.
+
+    Обход выполняется по уровням BFS, листинги каталогов одного уровня запрашиваются
+    параллельно (не более MAX_THREADS одновременных запросов, rate limiter контролирует
+    общее количество запросов в секунду).
+    """
+    all_items: list[dict] = []
+    visited: set[str] = set()
+    current_level: list[str] = [vd_root_path]
+
+    while current_level:
+        to_fetch: list[str] = []
+        for path in current_level:
+            if path in visited:
+                continue
+            visited.add(path)
+            to_fetch.append(path)
+
+        if not to_fetch:
+            break
+
+        next_level: list[str] = []
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_path = {
+                executor.submit(fetch_full_vd_directory_listing, token, path): path
+                for path in to_fetch
+            }
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                items, error = future.result()
+                if error:
+                    logger.warning(f"Ошибка при листинге {path}: {error}")
+                    continue
+                for item in (items or []):
+                    all_items.append(item)
+                    if item.get("type") == "dir":
+                        raw_item_path = item.get("path", "")
+                        item_path = normalize_vd_path_from_api(raw_item_path)
+                        if item_path and item_path not in visited:
+                            next_level.append(item_path)
+
+        current_level = next_level
+
+    return all_items
+
+
+def walk_personal_all_items(token: str, root_path: str) -> list[dict]:
+    """Рекурсивно обходит все ресурсы личного диска начиная с указанного пути.
+
+    Обход выполняется по уровням BFS, листинги каталогов одного уровня запрашиваются
+    параллельно (не более MAX_THREADS одновременных запросов, rate limiter контролирует
+    общее количество запросов в секунду).
+    """
+    all_items: list[dict] = []
+    visited: set[str] = set()
+    current_level: list[str] = [root_path]
+
+    while current_level:
+        to_fetch: list[str] = []
+        for path in current_level:
+            if path in visited:
+                continue
+            visited.add(path)
+            to_fetch.append(path)
+
+        if not to_fetch:
+            break
+
+        next_level: list[str] = []
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_path = {
+                executor.submit(fetch_full_directory_listing, token, path): path
+                for path in to_fetch
+            }
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                items, error = future.result()
+                if error:
+                    logger.warning(f"Ошибка при листинге {path}: {error}")
+                    continue
+                for item in (items or []):
+                    all_items.append(item)
+                    if item.get("type") == "dir":
+                        item_path = item.get("path", "")
+                        if item_path and item_path not in visited:
+                            next_level.append(item_path)
+
+        current_level = next_level
+
+    return all_items
+
+
 def get_shared_disk_resources_metadata(settings: "SettingParams"):
     input_file = settings.disk_resource_input_file
     output_file = settings.resource_output_file
@@ -1745,6 +2015,11 @@ def get_shared_disk_resources_metadata(settings: "SettingParams"):
 
     # ── Фаза 1: прямой поиск по оригинальному пути ──
     logger.info("=== Фаза 1: поиск по оригинальному пути ===")
+
+    def _phase1_fetch(idx: int, vd_path: str):
+        data, meta_error = get_resource_metadata(token, vd_path)
+        return idx, vd_path, data, meta_error
+
     for vd_num, vd_hash in enumerate(vd_hashes, start=1):
         if not remaining:
             break
@@ -1756,43 +2031,49 @@ def get_shared_disk_resources_metadata(settings: "SettingParams"):
         still_remaining: set[int] = set()
         found_by_vd = 0
 
-        for idx in sorted(remaining):
-            full_path = rows[idx]
-            vd_path = build_vd_path(vd_hash, full_path)
+        tasks = [
+            (idx, build_vd_path(vd_hash, rows[idx])) for idx in sorted(remaining)
+        ]
+        for idx, vd_path in tasks:
             logger.debug(
                 f"[{idx + 1}/{len(rows)}] [Фаза 1] Запрос у vd:{vd_hash}: {vd_path}"
             )
 
-            data, meta_error = get_resource_metadata(token, vd_path)
-            if data:
-                resource_type = data.get("type", "")
-                if resource_type == "file":
-                    count_files += 1
-                elif resource_type == "dir":
-                    count_dirs += 1
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [
+                executor.submit(_phase1_fetch, idx, vd_path)
+                for idx, vd_path in tasks
+            ]
+            for future in as_completed(futures):
+                idx, _vd_path, data, meta_error = future.result()
+                if data:
+                    resource_type = data.get("type", "")
+                    if resource_type == "file":
+                        count_files += 1
+                    elif resource_type == "dir":
+                        count_dirs += 1
 
-                results[idx] = {
-                    "name": data.get("name", ""),
-                    "path": data.get("path", ""),
-                    "created": data.get("created", ""),
-                    "modified": data.get("modified", ""),
-                    "md5": data.get("md5", ""),
-                    "sha256": data.get("sha256", ""),
-                    "type": resource_type,
-                    "size": data.get("size", ""),
-                    "source": vd_hash,
-                    "error": "",
-                }
-                count_found += 1
-                found_by_vd += 1
-            else:
-                if meta_error and "404" not in meta_error:
-                    logger.warning(
-                        f"[{idx + 1}/{len(rows)}] [Фаза 1] vd:{vd_hash}: {meta_error}"
-                    )
-                still_remaining.add(idx)
-
-            time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                    results[idx] = {
+                        "name": data.get("name", ""),
+                        "path": data.get("path", ""),
+                        "created": data.get("created", ""),
+                        "modified": data.get("modified", ""),
+                        "md5": data.get("md5", ""),
+                        "sha256": data.get("sha256", ""),
+                        "type": resource_type,
+                        "size": data.get("size", ""),
+                        "public_url": data.get("public_url", ""),
+                        "source": vd_hash,
+                        "error": "",
+                    }
+                    count_found += 1
+                    found_by_vd += 1
+                else:
+                    if meta_error and "404" not in meta_error:
+                        logger.warning(
+                            f"[{idx + 1}/{len(rows)}] [Фаза 1] vd:{vd_hash}: {meta_error}"
+                        )
+                    still_remaining.add(idx)
 
         remaining = still_remaining
         logger.info(
@@ -1813,6 +2094,18 @@ def get_shared_disk_resources_metadata(settings: "SettingParams"):
     # ── Фаза 2: case-insensitive поиск для ненайденных ──
     if remaining:
         logger.info("=== Фаза 2: поиск с учётом регистра (case-insensitive) ===")
+
+        def _phase2_resolve_and_fetch(
+            idx: int, full_path: str, vd_hash_inner: str, cache: dict
+        ):
+            resolved_path, resolve_error = resolve_case_insensitive_vd_path(
+                token, vd_hash_inner, full_path, cache
+            )
+            if resolve_error or resolved_path is None:
+                return idx, full_path, resolved_path, resolve_error, None, None
+            data, meta_error = get_resource_metadata(token, resolved_path)
+            return idx, full_path, resolved_path, None, data, meta_error
+
         for vd_num, vd_hash in enumerate(vd_hashes, start=1):
             if not remaining:
                 break
@@ -1826,77 +2119,96 @@ def get_shared_disk_resources_metadata(settings: "SettingParams"):
             found_by_vd = 0
 
             for idx in sorted(remaining):
-                full_path = rows[idx]
                 logger.debug(
-                    f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск у vd:{vd_hash}: {full_path}"
+                    f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск у vd:{vd_hash}: {rows[idx]}"
                 )
 
-                resolved_path, resolve_error = resolve_case_insensitive_vd_path(
-                    token, vd_hash, full_path, dir_cache
-                )
-
-                if resolve_error:
-                    logger.warning(
-                        f"[{idx + 1}/{len(rows)}] [Фаза 2] vd:{vd_hash}: {resolve_error}"
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = [
+                    executor.submit(
+                        _phase2_resolve_and_fetch,
+                        idx,
+                        rows[idx],
+                        vd_hash,
+                        dir_cache,
                     )
-                    is_ambiguous = "Неоднозначность" in resolve_error
-                    if not is_ambiguous:
+                    for idx in sorted(remaining)
+                ]
+                for future in as_completed(futures):
+                    (
+                        idx,
+                        full_path,
+                        resolved_path,
+                        resolve_error,
+                        data,
+                        meta_error,
+                    ) = future.result()
+
+                    if resolve_error:
+                        logger.warning(
+                            f"[{idx + 1}/{len(rows)}] [Фаза 2] vd:{vd_hash}: "
+                            f"{resolve_error}"
+                        )
+                        is_ambiguous = "Неоднозначность" in resolve_error
+                        if not is_ambiguous:
+                            still_remaining_p2.add(idx)
+                            continue
+                        cleaned = full_path.replace("\\", "/")
+                        if cleaned.lower().startswith("<root>"):
+                            cleaned = cleaned[len("<root>"):]
+                        name = (
+                            cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+                        )
+                        results[idx] = {
+                            "name": name,
+                            "path": full_path,
+                            "created": "",
+                            "modified": "",
+                            "md5": "",
+                            "sha256": "",
+                            "type": "",
+                            "size": "",
+                            "public_url": "",
+                            "source": vd_hash,
+                            "error": resolve_error,
+                        }
+                        count_ambiguous += 1
+                        continue
+
+                    if resolved_path is None:
                         still_remaining_p2.add(idx)
                         continue
-                    cleaned = full_path.replace("\\", "/")
-                    if cleaned.lower().startswith("<root>"):
-                        cleaned = cleaned[len("<root>"):]
-                    name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
-                    results[idx] = {
-                        "name": name,
-                        "path": full_path,
-                        "created": "",
-                        "modified": "",
-                        "md5": "",
-                        "sha256": "",
-                        "type": "",
-                        "size": "",
-                        "source": vd_hash,
-                        "error": resolve_error,
-                    }
-                    count_ambiguous += 1
-                    continue
 
-                if resolved_path is None:
-                    still_remaining_p2.add(idx)
-                    continue
+                    if data:
+                        resource_type = data.get("type", "")
+                        if resource_type == "file":
+                            count_files += 1
+                        elif resource_type == "dir":
+                            count_dirs += 1
 
-                data, meta_error = get_resource_metadata(token, resolved_path)
-                if data:
-                    resource_type = data.get("type", "")
-                    if resource_type == "file":
-                        count_files += 1
-                    elif resource_type == "dir":
-                        count_dirs += 1
-
-                    results[idx] = {
-                        "name": data.get("name", ""),
-                        "path": data.get("path", ""),
-                        "created": data.get("created", ""),
-                        "modified": data.get("modified", ""),
-                        "md5": data.get("md5", ""),
-                        "sha256": data.get("sha256", ""),
-                        "type": resource_type,
-                        "size": data.get("size", ""),
-                        "source": vd_hash,
-                        "error": "",
-                    }
-                    count_found += 1
-                    found_by_vd += 1
-                else:
-                    if meta_error and "404" not in meta_error:
-                        logger.warning(
-                            f"[{idx + 1}/{len(rows)}] [Фаза 2] vd:{vd_hash}: {meta_error}"
-                        )
-                        count_errors += 1
-                    still_remaining_p2.add(idx)
-
-                time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                        results[idx] = {
+                            "name": data.get("name", ""),
+                            "path": data.get("path", ""),
+                            "created": data.get("created", ""),
+                            "modified": data.get("modified", ""),
+                            "md5": data.get("md5", ""),
+                            "sha256": data.get("sha256", ""),
+                            "type": resource_type,
+                            "size": data.get("size", ""),
+                            "public_url": data.get("public_url", ""),
+                            "source": vd_hash,
+                            "error": "",
+                        }
+                        count_found += 1
+                        found_by_vd += 1
+                    else:
+                        if meta_error and "404" not in meta_error:
+                            logger.warning(
+                                f"[{idx + 1}/{len(rows)}] [Фаза 2] vd:{vd_hash}: "
+                                f"{meta_error}"
+                            )
+                            count_errors += 1
+                        still_remaining_p2.add(idx)
 
             remaining = still_remaining_p2
             logger.info(
@@ -1920,6 +2232,7 @@ def get_shared_disk_resources_metadata(settings: "SettingParams"):
             "sha256": "",
             "type": "",
             "size": "",
+            "public_url": "",
             "source": "",
             "error": "",
         }
@@ -2017,6 +2330,11 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
 
     # ── Фаза 1: прямой поиск по оригинальному пути ──
     logger.info("=== Фаза 1: поиск по оригинальному пути ===")
+
+    def _personal_phase1_fetch(idx: int, disk_path: str, user_token: str):
+        data, meta_error = get_personal_resource_metadata(user_token, disk_path)
+        return idx, disk_path, data, meta_error
+
     for user_num, (email, token) in enumerate(user_tokens.items(), start=1):
         if not remaining:
             break
@@ -2028,6 +2346,7 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
         still_remaining: set[int] = set()
         found_by_user = 0
 
+        tasks: list[tuple[int, str]] = []
         for idx in sorted(remaining):
             full_path = rows[idx]
             components = _parse_path_components(full_path)
@@ -2038,37 +2357,43 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
             logger.debug(
                 f"[{idx + 1}/{len(rows)}] [Фаза 1] Запрос у {email}: {disk_path}"
             )
+            tasks.append((idx, disk_path))
 
-            data, meta_error = get_personal_resource_metadata(token, disk_path)
-            if data:
-                resource_type = data.get("type", "")
-                if resource_type == "file":
-                    count_files += 1
-                elif resource_type == "dir":
-                    count_dirs += 1
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [
+                executor.submit(_personal_phase1_fetch, idx, disk_path, token)
+                for idx, disk_path in tasks
+            ]
+            for future in as_completed(futures):
+                idx, _disk_path, data, meta_error = future.result()
+                if data:
+                    resource_type = data.get("type", "")
+                    if resource_type == "file":
+                        count_files += 1
+                    elif resource_type == "dir":
+                        count_dirs += 1
 
-                results[idx] = {
-                    "name": data.get("name", ""),
-                    "path": data.get("path", ""),
-                    "created": data.get("created", ""),
-                    "modified": data.get("modified", ""),
-                    "md5": data.get("md5", ""),
-                    "sha256": data.get("sha256", ""),
-                    "type": resource_type,
-                    "size": data.get("size", ""),
-                    "source": email,
-                    "error": "",
-                }
-                count_found += 1
-                found_by_user += 1
-            else:
-                if meta_error and "404" not in meta_error:
-                    logger.warning(
-                        f"[{idx + 1}/{len(rows)}] [Фаза 1] {email}: {meta_error}"
-                    )
-                still_remaining.add(idx)
-
-            time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                    results[idx] = {
+                        "name": data.get("name", ""),
+                        "path": data.get("path", ""),
+                        "created": data.get("created", ""),
+                        "modified": data.get("modified", ""),
+                        "md5": data.get("md5", ""),
+                        "sha256": data.get("sha256", ""),
+                        "type": resource_type,
+                        "size": data.get("size", ""),
+                        "public_url": data.get("public_url", ""),
+                        "source": email,
+                        "error": "",
+                    }
+                    count_found += 1
+                    found_by_user += 1
+                else:
+                    if meta_error and "404" not in meta_error:
+                        logger.warning(
+                            f"[{idx + 1}/{len(rows)}] [Фаза 1] {email}: {meta_error}"
+                        )
+                    still_remaining.add(idx)
 
         remaining = still_remaining
         logger.info(
@@ -2088,6 +2413,20 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
     # ── Фаза 2: case-insensitive поиск для ненайденных ──
     if remaining:
         logger.info("=== Фаза 2: поиск с учётом регистра (case-insensitive) ===")
+
+        def _personal_phase2_resolve_and_fetch(
+            idx: int, full_path: str, user_token: str, cache: dict
+        ):
+            resolved_path, resolve_error = resolve_case_insensitive_path(
+                user_token, full_path, cache
+            )
+            if resolve_error or resolved_path is None:
+                return idx, full_path, resolved_path, resolve_error, None, None
+            data, meta_error = get_personal_resource_metadata(
+                user_token, resolved_path
+            )
+            return idx, full_path, resolved_path, None, data, meta_error
+
         for user_num, (email, token) in enumerate(user_tokens.items(), start=1):
             if not remaining:
                 break
@@ -2101,73 +2440,91 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
             found_by_user = 0
 
             for idx in sorted(remaining):
-                full_path = rows[idx]
                 logger.debug(
-                    f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск у {email}: {full_path}"
+                    f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск у {email}: {rows[idx]}"
                 )
 
-                resolved_path, resolve_error = resolve_case_insensitive_path(
-                    token, full_path, dir_cache
-                )
-
-                if resolve_error:
-                    logger.warning(
-                        f"[{idx + 1}/{len(rows)}] [Фаза 2] {email}: {resolve_error}"
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = [
+                    executor.submit(
+                        _personal_phase2_resolve_and_fetch,
+                        idx,
+                        rows[idx],
+                        token,
+                        dir_cache,
                     )
-                    cleaned = full_path.replace("\\", "/")
-                    if cleaned.lower().startswith("<root>"):
-                        cleaned = cleaned[len("<root>"):]
-                    name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
-                    results[idx] = {
-                        "name": name,
-                        "path": full_path,
-                        "created": "",
-                        "modified": "",
-                        "md5": "",
-                        "sha256": "",
-                        "type": "",
-                        "size": "",
-                        "source": email,
-                        "error": resolve_error,
-                    }
-                    count_ambiguous += 1
-                    continue
+                    for idx in sorted(remaining)
+                ]
+                for future in as_completed(futures):
+                    (
+                        idx,
+                        full_path,
+                        resolved_path,
+                        resolve_error,
+                        data,
+                        meta_error,
+                    ) = future.result()
 
-                if resolved_path is None:
-                    still_remaining_p2.add(idx)
-                    continue
-
-                data, meta_error = get_personal_resource_metadata(token, resolved_path)
-                if data:
-                    resource_type = data.get("type", "")
-                    if resource_type == "file":
-                        count_files += 1
-                    elif resource_type == "dir":
-                        count_dirs += 1
-
-                    results[idx] = {
-                        "name": data.get("name", ""),
-                        "path": data.get("path", ""),
-                        "created": data.get("created", ""),
-                        "modified": data.get("modified", ""),
-                        "md5": data.get("md5", ""),
-                        "sha256": data.get("sha256", ""),
-                        "type": resource_type,
-                        "size": data.get("size", ""),
-                        "source": email,
-                        "error": "",
-                    }
-                    count_found += 1
-                    found_by_user += 1
-                else:
-                    if meta_error and "404" not in meta_error:
+                    if resolve_error:
                         logger.warning(
-                            f"[{idx + 1}/{len(rows)}] [Фаза 2] {email}: {meta_error}"
+                            f"[{idx + 1}/{len(rows)}] [Фаза 2] {email}: {resolve_error}"
                         )
-                        count_errors += 1
-                    still_remaining_p2.add(idx)
+                        cleaned = full_path.replace("\\", "/")
+                        if cleaned.lower().startswith("<root>"):
+                            cleaned = cleaned[len("<root>"):]
+                        name = (
+                            cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+                        )
+                        results[idx] = {
+                            "name": name,
+                            "path": full_path,
+                            "created": "",
+                            "modified": "",
+                            "md5": "",
+                            "sha256": "",
+                            "type": "",
+                            "size": "",
+                            "public_url": "",
+                            "source": email,
+                            "error": resolve_error,
+                        }
+                        count_ambiguous += 1
+                        continue
 
-                time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                    if resolved_path is None:
+                        still_remaining_p2.add(idx)
+                        continue
+
+                    if data:
+                        resource_type = data.get("type", "")
+                        if resource_type == "file":
+                            count_files += 1
+                        elif resource_type == "dir":
+                            count_dirs += 1
+
+                        results[idx] = {
+                            "name": data.get("name", ""),
+                            "path": data.get("path", ""),
+                            "created": data.get("created", ""),
+                            "modified": data.get("modified", ""),
+                            "md5": data.get("md5", ""),
+                            "sha256": data.get("sha256", ""),
+                            "type": resource_type,
+                            "size": data.get("size", ""),
+                            "public_url": data.get("public_url", ""),
+                            "source": email,
+                            "error": "",
+                        }
+                        count_found += 1
+                        found_by_user += 1
+                    else:
+                        if meta_error and "404" not in meta_error:
+                            logger.warning(
+                                f"[{idx + 1}/{len(rows)}] [Фаза 2] {email}: "
+                                f"{meta_error}"
+                            )
+                            count_errors += 1
+                        still_remaining_p2.add(idx)
 
             remaining = still_remaining_p2
             logger.info(
@@ -2191,6 +2548,7 @@ def get_personal_disk_resources_metadata(settings: "SettingParams"):
             "sha256": "",
             "type": "",
             "size": "",
+            "public_url": "",
             "source": "",
             "error": "",
         }
@@ -2259,6 +2617,11 @@ def get_my_disk_resources_metadata(settings: "SettingParams"):
     logger.info("=== Фаза 1: поиск по оригинальному пути ===")
     still_remaining: set[int] = set()
 
+    def _my_phase1_fetch(idx: int, disk_path: str):
+        data, meta_error = get_personal_resource_metadata(token, disk_path)
+        return idx, disk_path, data, meta_error
+
+    tasks: list[tuple[int, str]] = []
     for idx in sorted(remaining):
         full_path = rows[idx]
         components = _parse_path_components(full_path)
@@ -2269,36 +2632,42 @@ def get_my_disk_resources_metadata(settings: "SettingParams"):
         logger.debug(
             f"[{idx + 1}/{len(rows)}] [Фаза 1] Запрос: {disk_path}"
         )
+        tasks.append((idx, disk_path))
 
-        data, meta_error = get_personal_resource_metadata(token, disk_path)
-        if data:
-            resource_type = data.get("type", "")
-            if resource_type == "file":
-                count_files += 1
-            elif resource_type == "dir":
-                count_dirs += 1
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = [
+            executor.submit(_my_phase1_fetch, idx, disk_path)
+            for idx, disk_path in tasks
+        ]
+        for future in as_completed(futures):
+            idx, _disk_path, data, meta_error = future.result()
+            if data:
+                resource_type = data.get("type", "")
+                if resource_type == "file":
+                    count_files += 1
+                elif resource_type == "dir":
+                    count_dirs += 1
 
-            results[idx] = {
-                "name": data.get("name", ""),
-                "path": data.get("path", ""),
-                "created": data.get("created", ""),
-                "modified": data.get("modified", ""),
-                "md5": data.get("md5", ""),
-                "sha256": data.get("sha256", ""),
-                "type": resource_type,
-                "size": data.get("size", ""),
-                "source": "my_disk",
-                "error": "",
-            }
-            count_found += 1
-        else:
-            if meta_error and "404" not in meta_error:
-                logger.warning(
-                    f"[{idx + 1}/{len(rows)}] [Фаза 1] {meta_error}"
-                )
-            still_remaining.add(idx)
-
-        time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                results[idx] = {
+                    "name": data.get("name", ""),
+                    "path": data.get("path", ""),
+                    "created": data.get("created", ""),
+                    "modified": data.get("modified", ""),
+                    "md5": data.get("md5", ""),
+                    "sha256": data.get("sha256", ""),
+                    "type": resource_type,
+                    "size": data.get("size", ""),
+                    "public_url": data.get("public_url", ""),
+                    "source": "my_disk",
+                    "error": "",
+                }
+                count_found += 1
+            else:
+                if meta_error and "404" not in meta_error:
+                    logger.warning(
+                        f"[{idx + 1}/{len(rows)}] [Фаза 1] {meta_error}"
+                    )
+                still_remaining.add(idx)
 
     remaining = still_remaining
     logger.info(
@@ -2322,73 +2691,93 @@ def get_my_disk_resources_metadata(settings: "SettingParams"):
         dir_cache: dict[str, dict] = {}
         still_remaining_p2: set[int] = set()
 
-        for idx in sorted(remaining):
-            full_path = rows[idx]
-            logger.debug(
-                f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск: {full_path}"
-            )
-
+        def _my_phase2_resolve_and_fetch(idx: int, full_path: str, cache: dict):
             resolved_path, resolve_error = resolve_case_insensitive_path(
-                token, full_path, dir_cache
+                token, full_path, cache
+            )
+            if resolve_error or resolved_path is None:
+                return idx, full_path, resolved_path, resolve_error, None, None
+            data, meta_error = get_personal_resource_metadata(token, resolved_path)
+            return idx, full_path, resolved_path, None, data, meta_error
+
+        for idx in sorted(remaining):
+            logger.debug(
+                f"[{idx + 1}/{len(rows)}] [Фаза 2] Поиск: {rows[idx]}"
             )
 
-            if resolve_error:
-                logger.warning(
-                    f"[{idx + 1}/{len(rows)}] [Фаза 2] {resolve_error}"
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [
+                executor.submit(
+                    _my_phase2_resolve_and_fetch, idx, rows[idx], dir_cache
                 )
-                cleaned = full_path.replace("\\", "/")
-                if cleaned.lower().startswith("<root>"):
-                    cleaned = cleaned[len("<root>"):]
-                name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
-                results[idx] = {
-                    "name": name,
-                    "path": full_path,
-                    "created": "",
-                    "modified": "",
-                    "md5": "",
-                    "sha256": "",
-                    "type": "",
-                    "size": "",
-                    "source": "my_disk",
-                    "error": resolve_error,
-                }
-                count_ambiguous += 1
-                continue
+                for idx in sorted(remaining)
+            ]
+            for future in as_completed(futures):
+                (
+                    idx,
+                    full_path,
+                    resolved_path,
+                    resolve_error,
+                    data,
+                    meta_error,
+                ) = future.result()
 
-            if resolved_path is None:
-                still_remaining_p2.add(idx)
-                continue
-
-            data, meta_error = get_personal_resource_metadata(token, resolved_path)
-            if data:
-                resource_type = data.get("type", "")
-                if resource_type == "file":
-                    count_files += 1
-                elif resource_type == "dir":
-                    count_dirs += 1
-
-                results[idx] = {
-                    "name": data.get("name", ""),
-                    "path": data.get("path", ""),
-                    "created": data.get("created", ""),
-                    "modified": data.get("modified", ""),
-                    "md5": data.get("md5", ""),
-                    "sha256": data.get("sha256", ""),
-                    "type": resource_type,
-                    "size": data.get("size", ""),
-                    "source": "my_disk",
-                    "error": "",
-                }
-                count_found += 1
-            else:
-                if meta_error and "404" not in meta_error:
+                if resolve_error:
                     logger.warning(
-                        f"[{idx + 1}/{len(rows)}] [Фаза 2] {meta_error}"
+                        f"[{idx + 1}/{len(rows)}] [Фаза 2] {resolve_error}"
                     )
-                    count_errors += 1
-                still_remaining_p2.add(idx)
+                    cleaned = full_path.replace("\\", "/")
+                    if cleaned.lower().startswith("<root>"):
+                        cleaned = cleaned[len("<root>"):]
+                    name = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+                    results[idx] = {
+                        "name": name,
+                        "path": full_path,
+                        "created": "",
+                        "modified": "",
+                        "md5": "",
+                        "sha256": "",
+                        "type": "",
+                        "size": "",
+                        "public_url": "",
+                        "source": "my_disk",
+                        "error": resolve_error,
+                    }
+                    count_ambiguous += 1
+                    continue
 
-            time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                if resolved_path is None:
+                    still_remaining_p2.add(idx)
+                    continue
+
+                if data:
+                    resource_type = data.get("type", "")
+                    if resource_type == "file":
+                        count_files += 1
+                    elif resource_type == "dir":
+                        count_dirs += 1
+
+                    results[idx] = {
+                        "name": data.get("name", ""),
+                        "path": data.get("path", ""),
+                        "created": data.get("created", ""),
+                        "modified": data.get("modified", ""),
+                        "md5": data.get("md5", ""),
+                        "sha256": data.get("sha256", ""),
+                        "type": resource_type,
+                        "size": data.get("size", ""),
+                        "public_url": data.get("public_url", ""),
+                        "source": "my_disk",
+                        "error": "",
+                    }
+                    count_found += 1
+                else:
+                    if meta_error and "404" not in meta_error:
+                        logger.warning(
+                            f"[{idx + 1}/{len(rows)}] [Фаза 2] {meta_error}"
+                        )
+                        count_errors += 1
+                    still_remaining_p2.add(idx)
 
         remaining = still_remaining_p2
         logger.info(
@@ -2412,6 +2801,7 @@ def get_my_disk_resources_metadata(settings: "SettingParams"):
             "sha256": "",
             "type": "",
             "size": "",
+            "public_url": "",
             "source": "",
             "error": "",
         }
@@ -2433,6 +2823,174 @@ def get_my_disk_resources_metadata(settings: "SettingParams"):
     print(f"  Ошибки неоднозначности:          {count_ambiguous}")
     print(f"  Ошибки API:                      {count_errors}")
     print(f"\nРезультаты записаны в: {output_file}")
+    print("=" * 80)
+
+
+# ─────────────────────── Листинг всех ресурсов ───────────────────────
+
+
+def list_all_shared_disk_resources(settings: "SettingParams"):
+    """Выгружает список всех ресурсов общих дисков (VD) в CSV без сравнения."""
+    vd_hashes = settings.vd_hashes
+    token = settings.oauth_token
+    output_file = settings.resource_output_file
+    single_file = settings.single_report_file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if not vd_hashes:
+        logger.error(
+            "VD_HASHES не задан. Укажите метки общих дисков в .env и повторите попытку."
+        )
+        return
+
+    all_results: list[dict] = []
+    output_files: list[tuple[str, str, int]] = []
+    total_count = 0
+
+    for vd_num, vd_hash in enumerate(vd_hashes, start=1):
+        logger.info(
+            f"Обход ресурсов диска {vd_num}/{len(vd_hashes)}: vd:{vd_hash}"
+        )
+        vd_root = f"vd:{vd_hash}:disk:/"
+        items = walk_vd_all_items(token, vd_root)
+        count = len(items)
+        total_count += count
+        logger.info(f"Диск vd:{vd_hash}: найдено {count} ресурсов")
+
+        rows = [item_to_csv_row(item, vd_hash) for item in items]
+
+        if single_file:
+            all_results.extend(rows)
+        else:
+            safe_hash = safe_filename(vd_hash)
+            out_path = build_report_filepath(output_file, timestamp, f"vd_{safe_hash}")
+            if write_csv_file(rows, out_path, RESOURCE_OUTPUT_FIELDNAMES):
+                output_files.append((vd_hash, out_path, count))
+
+    print("\n" + "=" * 80)
+    print("Сводная информация:")
+    if single_file:
+        # Для общего диска формируем имя shared_disk_<timestamp>.csv
+        stem, ext = os.path.splitext(output_file)
+        out_path = f"shared_disk_{timestamp}{ext}"
+        if write_csv_file(all_results, out_path, RESOURCE_OUTPUT_FIELDNAMES):
+            print(f"  Всего ресурсов:           {total_count}")
+            print(f"  Общих дисков обработано:  {len(vd_hashes)}")
+            print(f"\n  Результаты записаны в: {out_path}")
+    else:
+        print(f"  Общих дисков обработано:  {len(vd_hashes)}")
+        print(f"  Всего ресурсов:           {total_count}")
+        print()
+        for vd_hash, out_path, count in output_files:
+            print(f"  vd:{vd_hash}: {count} ресурсов -> {out_path}")
+    print("=" * 80)
+
+
+def list_all_personal_disk_resources(settings: "SettingParams"):
+    """Выгружает список всех ресурсов персональных дисков указанных пользователей в CSV."""
+    output_file = settings.resource_output_file
+    single_file = settings.single_report_file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if not settings.service_app_status:
+        logger.error(
+            "Сервисное приложение не настроено. "
+            "Настройте сервисное приложение через меню настроек (пункт 9)."
+        )
+        return
+
+    users_to_search, break_flag, double_users_flag, _all_users_flag = (
+        find_users_prompt(settings)
+    )
+    if break_flag or double_users_flag or not users_to_search:
+        if not break_flag and not double_users_flag and not users_to_search:
+            logger.error("Не указаны пользователи для поиска.")
+        return
+
+    user_tokens: dict[str, str] = {}
+    for user in users_to_search:
+        email = user.get("email", "")
+        if not email:
+            continue
+        try:
+            token = get_service_app_token(settings, email)
+            user_tokens[email] = token
+            logger.debug(f"Получен токен для {email}")
+        except TokenError as e:
+            logger.warning(f"Не удалось получить токен для {email}: {e}")
+        time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+
+    if not user_tokens:
+        logger.error("Не удалось получить токены ни для одного пользователя.")
+        return
+
+    logger.info(f"Получены токены для {len(user_tokens)} пользователей")
+
+    all_results: list[dict] = []
+    output_files: list[tuple[str, str, int]] = []
+    total_count = 0
+
+    for user_num, (email, token) in enumerate(user_tokens.items(), start=1):
+        logger.info(
+            f"Обход ресурсов пользователя {user_num}/{len(user_tokens)}: {email}"
+        )
+        items = walk_personal_all_items(token, "disk:/")
+        count = len(items)
+        total_count += count
+        logger.info(f"Пользователь {email}: найдено {count} ресурсов")
+
+        rows = [item_to_csv_row(item, email) for item in items]
+
+        if single_file:
+            all_results.extend(rows)
+        else:
+            # Извлекаем имя пользователя из email (часть до @)
+            username = email.split("@")[0] if "@" in email else email
+            safe_username = safe_filename(username)
+            stem, ext = os.path.splitext(output_file)
+            out_path = f"{safe_username}_{timestamp}{ext}"
+            if write_csv_file(rows, out_path, RESOURCE_OUTPUT_FIELDNAMES):
+                output_files.append((email, out_path, count))
+
+    print("\n" + "=" * 80)
+    print("Сводная информация:")
+    if single_file:
+        # Для персональных дисков формируем имя personal_disk_<timestamp>.csv
+        stem, ext = os.path.splitext(output_file)
+        out_path = f"personal_disk_{timestamp}{ext}"
+        if write_csv_file(all_results, out_path, RESOURCE_OUTPUT_FIELDNAMES):
+            print(f"  Всего ресурсов:              {total_count}")
+            print(f"  Пользователей обработано:    {len(user_tokens)}")
+            print(f"\n  Результаты записаны в: {out_path}")
+    else:
+        print(f"  Пользователей обработано:    {len(user_tokens)}")
+        print(f"  Всего ресурсов:              {total_count}")
+        print()
+        for email, out_path, count in output_files:
+            print(f"  {email}: {count} ресурсов -> {out_path}")
+    print("=" * 80)
+
+
+def list_all_my_disk_resources(settings: "SettingParams"):
+    """Выгружает список всех ресурсов личного Диска текущего пользователя в CSV."""
+    token = settings.oauth_token
+    output_file = settings.resource_output_file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    logger.info("Обход ресурсов личного Диска текущего пользователя (OAUTH_TOKEN)")
+    items = walk_personal_all_items(token, "disk:/")
+    count = len(items)
+    logger.info(f"Найдено {count} ресурсов")
+
+    rows = [item_to_csv_row(item, "my_disk") for item in items]
+    out_path = build_report_filepath(output_file, timestamp, "mydisk")
+    if not write_csv_file(rows, out_path, RESOURCE_OUTPUT_FIELDNAMES):
+        return
+
+    print("\n" + "=" * 80)
+    print("Сводная информация:")
+    print(f"  Всего ресурсов: {count}")
+    print(f"\n  Результаты записаны в: {out_path}")
     print("=" * 80)
 
 
@@ -2472,13 +3030,16 @@ def main_menu(settings: "SettingParams"):
     while True:
         print("\n")
         print("Выберите опцию:")
-        print("1. Получить метаданные ресурсов Общего Диска.")
-        print("2. Получить метаданные ресурсов из личных Дисков пользователей.")
-        print("3. Получить метаданные ресурсов с моего личного Диска.")
+        print("1. Найти метаданные ресурсов Общего Диска по входному файлу.")
+        print("2. Найти метаданные ресурсов из личных Дисков пользователей по входному файлу.")
+        print("3. Найти метаданные ресурсов с моего личного Диска по входному файлу.")
+        print("4. Получить список всех ресурсов общего диска.")
+        print("5. Получить список всех ресурсов персональных дисков пользователей.")
+        print("6. Получить список всех ресурсов моего личного диска.")
         print("9. Настройка сервисного приложения.")
         print("0. (Ctrl+C) Выход")
         print("\n")
-        choice = input("Введите ваш выбор (0,1,2,3,9): ")
+        choice = input("Введите ваш выбор (0,1,2,3,4,5,6,9): ")
 
         if choice == "0":
             print("До свидания!")
@@ -2489,6 +3050,12 @@ def main_menu(settings: "SettingParams"):
             get_personal_disk_resources_metadata(settings)
         elif choice == "3":
             get_my_disk_resources_metadata(settings)
+        elif choice == "4":
+            list_all_shared_disk_resources(settings)
+        elif choice == "5":
+            list_all_personal_disk_resources(settings)
+        elif choice == "6":
+            list_all_my_disk_resources(settings)
         elif choice == "9":
             service_application_status_menu(settings)
         else:
